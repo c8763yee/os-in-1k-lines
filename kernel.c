@@ -4,7 +4,7 @@ typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef uint32_t size_t;
 
-extern char __bss[], __bss_end[], __stack_top[];
+extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -27,6 +27,20 @@ struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
 
 void putchar(char ch) {
   sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+}
+
+paddr_t alloc_pages(uint32_t npage) {
+  static paddr_t next_paddr = (paddr_t)__free_ram;
+  paddr_t paddr = next_paddr;
+  next_paddr += npage * PAGE_SIZE;
+
+  // check if the next_paddr is within the free RAM range
+  if (next_paddr > (paddr_t)__free_ram_end) {
+    PANIC("Out of memory");
+  }
+
+  memset((void *)paddr, 0, npage * PAGE_SIZE); // Clear the allocated memory
+  return paddr;
 }
 
 void handle_trap(struct trap_frame *f) {
@@ -118,10 +132,13 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
 }
 
 void kernel_main(void) {
-  memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
+  memset(__bss, 0, (size_t)(__bss_end - __bss)); // Clear the BSS section
 
-  WRITE_CSR(stvec, (uint32_t)kernel_entry); // Set the trap vector
-  __asm__ __volatile__("unimp");
+  paddr_t paddr_0 = alloc_pages(2);
+  paddr_t paddr_1 = alloc_pages(1);
+  printf("alloc_pages test: paddr_0 = %x, paddr_1 = %x\n", paddr_0, paddr_1);
+
+  PANIC("booted");
 }
 
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
