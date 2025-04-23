@@ -29,21 +29,19 @@ void putchar(char ch) {
   sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
 }
 
-void kernel_main(void) {
-  PANIC("Kernel main function called");
-  const char *s1 = "123", *s2 = "124";
-  printf("\n\nHello %s\n", "World");
-  if (!strcmp(s1, s2))
-    printf("s1 == s2\n");
-  else
-    printf("s1 != s2\n");
-  for (;;) {
-    __asm__ __volatile__("wfi");
-  }
+void handle_trap(struct trap_frame *f) {
+  uint32_t cause = READ_CSR(scause);
+  uint32_t stval = READ_CSR(stval);
+  uint32_t user_pc = READ_CSR(sepc);
+  uint32_t sstatus = READ_CSR(sstatus);
+  PANIC("Trap occurred: scause = %x, stval = %x, sepc = %x, sstatus = %x\n",
+        cause, stval, user_pc, sstatus);
 }
 
 __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
-  __asm__ __volatile__("csrw sscratch, sp\n"
+  __asm__ __volatile__("csrw sscratch, sp\n" // use sscratch as temp SP storage
+
+                       // save all regesters to stack
                        "addi sp, sp, -4 * 31\n"
                        "sw ra,  4 * 0(sp)\n"
                        "sw gp,  4 * 1(sp)\n"
@@ -76,12 +74,15 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
                        "sw s10, 4 * 28(sp)\n"
                        "sw s11, 4 * 29(sp)\n"
 
+                       // save original SP
                        "csrr a0, sscratch\n"
                        "sw a0, 4 * 30(sp)\n"
 
+                       // calling `handle_trap(sp)` to handle the trap
                        "mv a0, sp\n"
                        "call handle_trap\n"
 
+                       // restore all registers from stack after trap
                        "lw ra,  4 * 0(sp)\n"
                        "lw gp,  4 * 1(sp)\n"
                        "lw tp,  4 * 2(sp)\n"
@@ -115,6 +116,14 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
                        "lw sp,  4 * 30(sp)\n"
                        "sret\n");
 }
+
+void kernel_main(void) {
+  memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
+
+  WRITE_CSR(stvec, (uint32_t)kernel_entry); // Set the trap vector
+  __asm__ __volatile__("unimp");
+}
+
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
   __asm__ __volatile__(
       "mv sp, %[stack_top]\n" // Set the stack pointer
