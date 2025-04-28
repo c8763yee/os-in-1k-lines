@@ -4,7 +4,8 @@ typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef uint32_t size_t;
 
-extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
+extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[],
+	__kernel_base[];
 
 struct process procs[PROCS_MAX];
 
@@ -77,35 +78,6 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp)
 		"ret\n");
 }
 
-struct process *create_process(uint32_t pc)
-{
-	struct process *proc = NULL;
-	int i;
-
-	// find unused process
-	for (i = 0; i < PROCS_MAX; i++) {
-		if (procs[i].state == PROC_UNUSED) {
-			proc = &procs[i];
-			break;
-		}
-	}
-
-	if (!proc)
-		PANIC("NONE OF FREE PROCESS SPOT CAN BE USED");
-
-	uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
-	for (int s = 11; s >= 0; s--) {
-		*--sp = 0; // set s11 ~ s0 to 0
-	}
-	*--sp = (uint32_t)pc; // set ra to pc
-
-	// initialize fields
-	proc->pid = i + 1;
-	proc->state = PROC_RUNNABLE;
-	proc->sp = (uint32_t)sp;
-	return proc;
-}
-
 void yield(void)
 {
 	// Find runnable process
@@ -118,16 +90,24 @@ void yield(void)
 			break;
 		}
 	}
-	
+
 	// return if no available process(next is same as current process)
 	if (next == current_proc)
 		return;
-	
+
 	__asm__ __volatile__(
-			"csrw sscratch, %[sscratch]\n"
-			:
-			: [sscratch] "r" ((uint32_t)&next->stack[sizeof(next->stack)])
-			);
+		// use sfence.vma to
+		// 	1. ensure change to page table are properly completed
+		// 	2. clear cache of page table entries (TLB)
+
+		"sfence.vma\n"
+		"csrw satp, %[satp]\n"
+		"sfence.vma\n"
+		"csrw sscratch, %[sscratch]\n"
+		:
+		: [satp] "r"(SATP_SV32 |
+			     ((uint32_t)next->page_table / PAGE_SIZE)),
+		  [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)]));
 
 	// context switch
 	struct process *prev = current_proc;
@@ -169,6 +149,66 @@ paddr_t alloc_pages(uint32_t npage)
 	return paddr;
 }
 
+/// virtual address
+/// offset: first 12 bits
+/// vpn0: 12 ~ 21 bits
+/// vpn1: 22 ~ 31 bits
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags)
+{
+	if (!is_aligned(vaddr, PAGE_SIZE))
+		PANIC("unaligne vaddr %x", vaddr);
+
+	if (!is_aligned(paddr, PAGE_SIZE))
+		PANIC("unaligne paddr %x", paddr);
+
+	uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+	if ((table1[vpn1] & PAGE_V) == 0) {
+		// Create the non-existent 2nd level page table
+		uint32_t pt_paddr = alloc_pages(1);
+		table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+	}
+
+	// Set the 2nd level pages table entry to mapping paddr
+	uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+	uint32_t *table0 = (uint32_t *)((table1[vpn1] >> 10) * PAGE_SIZE);
+	table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+struct process *create_process(uint32_t pc)
+{
+	struct process *proc = NULL;
+	int i;
+
+	// find unused process
+	for (i = 0; i < PROCS_MAX; i++) {
+		if (procs[i].state == PROC_UNUSED) {
+			proc = &procs[i];
+			break;
+		}
+	}
+
+	if (!proc)
+		PANIC("NONE OF FREE PROCESS SPOT CAN BE USED");
+
+	uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
+	for (int s = 11; s >= 0; s--) {
+		*--sp = 0; // set s11 ~ s0 to 0
+	}
+	*--sp = (uint32_t)pc; // set ra to pc
+
+	uint32_t *page_table = (uint32_t *)alloc_pages(1);
+	for (paddr_t paddr = (paddr_t)__kernel_base;
+	     paddr <= (paddr_t)__free_ram_end; paddr += PAGE_SIZE)
+		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
+	// initialize fields
+	proc->pid = i + 1;
+	proc->state = PROC_RUNNABLE;
+	proc->page_table = page_table;
+	proc->sp = (uint32_t)sp;
+	return proc;
+}
+
 void handle_trap(struct trap_frame *f)
 {
 	uint32_t cause = READ_CSR(scause);
@@ -183,7 +223,7 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void)
 {
 	__asm__ __volatile__(
 		// "csrw sscratch, sp\n" // use sscratch as temp SP storage
-		"csrrw sp, sscratch, sp"
+		"csrrw sp, sscratch, sp\n"
 
 		// save all regesters to stack
 		"addi sp, sp, -4 * 31\n"

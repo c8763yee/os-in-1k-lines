@@ -181,3 +181,8 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+
+# os-in-1k-line generated files
+kernel.map
+qemu.log
