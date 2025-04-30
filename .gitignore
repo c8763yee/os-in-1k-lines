@@ -184,5 +184,6 @@ sphinx_*/
 
 
 # os-in-1k-line generated files
-kernel.map
-qemu.log
+*.map
+*.log
+
