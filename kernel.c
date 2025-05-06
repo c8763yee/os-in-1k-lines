@@ -8,10 +8,17 @@ extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[],
 	__kernel_base[];
 extern char _binary_shell_bin_start[];
 extern char _binary_shell_bin_size[];
+
 struct process procs[PROCS_MAX];
 
 struct process *current_proc, *idle_proc;
 struct process *proc_a, *proc_b;
+
+struct virtio_virtq *blk_request_vq;
+struct virtio_blk_req *blk_req;
+paddr_t bld_req_paddr;
+unsigned blk_capacity;
+
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
 		       long arg5, long fid, long eid)
 {
@@ -42,6 +49,7 @@ int getchar(void)
 	struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
 	return ret.error;
 }
+
 __attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp)
 {
 	__asm__ __volatile__(
@@ -162,10 +170,10 @@ paddr_t alloc_pages(uint32_t npage)
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags)
 {
 	if (!is_aligned(vaddr, PAGE_SIZE))
-		PANIC("unaligne vaddr %x", vaddr);
+		PANIC("unaligned vaddr %x", vaddr);
 
 	if (!is_aligned(paddr, PAGE_SIZE))
-		PANIC("unaligne paddr %x", paddr);
+		PANIC("unaligned paddr %x", paddr);
 
 	uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
 	if ((table1[vpn1] & PAGE_V) == 0) {
@@ -219,6 +227,10 @@ struct process *create_process(const void *image, size_t image_size)
 	     paddr <= (paddr_t)__free_ram_end; paddr += PAGE_SIZE)
 		map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 
+	// Map virtio_blk MMIO region
+	map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR,
+		 PAGE_R | PAGE_W);
+
 	// Map user pages
 	for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
 		paddr_t page = alloc_pages(1);
@@ -229,6 +241,7 @@ struct process *create_process(const void *image, size_t image_size)
 							   remaining;
 
 		memcpy((void *)page, image + off, copy_size);
+
 		map_page(page_table, USER_BASE + off, page,
 			 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
 	}
@@ -276,7 +289,7 @@ void handle_trap(struct trap_frame *f)
 		handle_syscall(f);
 		user_pc += 4;
 	} else
-		PANIC("Unexpected trap occurred: scause = %x, stval = %x, sepc = %x, sstatus = %x\n",
+		PANIC("Unexpected trap occurred: scause = %x, stval = %x, sepc = %x, sstatus = x\n",
 		      scause, stval, user_pc, sstatus);
 	WRITE_CSR(sepc, user_pc);
 }
@@ -366,12 +379,118 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void)
 		"lw sp,  4 * 30(sp)\n"
 		"sret\n");
 }
+// virtio register util
+uint32_t virtio_reg_read32(unsigned offset)
+{
+	return *((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset));
+}
 
+uint64_t virtio_reg_read64(unsigned offset)
+{
+	return *((volatile uint64_t *)(VIRTIO_BLK_PADDR + offset));
+}
+
+void virtio_reg_write32(unsigned offset, uint32_t value)
+{
+	*((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value)
+{
+	virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+struct virtio_virtq *virtq_init(unsigned index)
+{
+	paddr_t virtq_paddr = alloc_pages(
+		align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+	struct virtio_virtq *vq = (struct virtio_virtq *)virtq_paddr;
+	vq->queue_index = index;
+	vq->used_index = (volatile uint16_t *)&(vq->used.index);
+
+	// 1. Select the queue writing it's index into QueueSel
+	virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+
+	// 2. check if the queue is not already in use
+	// 		(NOT Implemented for now)
+
+	// 3. Read Maximum queue size from  QueueNumMax
+	// 		(NOT Implemented for now)
+
+	// 4. ALlocate and zero the queue pages in contiguous virtual memory
+	// 		(NOT Implemented for now)
+
+	// 5. Notify the device about the queue size(writing to QueueNum)
+	virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+
+	// 6. Nofify the device about the used alignment(writing to QueueAlign)
+	virtio_reg_write32(VIRTIO_REG_QUEUE_ALIGN, 0);
+
+	// 7. Write physical addres of first page of the queue into QueuePFN
+	virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr);
+
+	return vq;
+}
+
+void virtio_blk_init(void)
+{
+	if (virtio_reg_read32(VIRTIO_REG_MAGIC) != VIRTIO_MAGIC_VALUE)
+		PANIC("VIRTIO MAGIC VALUE ERROR");
+
+	if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+		PANIC("Invalid VIRTIO VERSION");
+	if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+		PANIC("Invalid VIRTIO DEVICE ID");
+
+	// 1. Reset Device
+	virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+
+	// 2. Set ACK bit
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+
+	// 3. Set DRIVER status bit
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS,
+				  VIRTIO_STATUS_DRIVER);
+
+	// 4. Read device feature bits, and write subset featuer bits
+	// 		(NOT Implemented for now)
+
+	// 5. Set FEATURES_OK bit
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS,
+				  VIRTIO_STATUS_FEAT_OK);
+
+	// 6. Re-read device status to ensure FEATURES_OK bit is set
+	if ((virtio_reg_read32(VIRTIO_REG_DEVICE_STATUS) &
+	     VIRTIO_STATUS_FEAT_OK) != VIRTIO_STATUS_FEAT_OK)
+		PANIC("FEATURES_OK bit not set");
+
+	// 7. perform device-specific setup
+	blk_request_vq = virtq_init(0);
+
+	// 8. Set DRIVER_OK bit
+	virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS,
+				  VIRTIO_STATUS_DRIVER_OK);
+
+	// Get disk capacity
+	// TODO: Find out the reason why I need to add 0 to the device config
+	blk_capacity =
+		virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+
+	printf("blk_capacity = %d\n", blk_capacity);
+
+	// ALlocation region to store requests
+	bld_req_paddr =
+		alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+	blk_req = (struct virtio_blk_req *)bld_req_paddr;
+}
+
+// kernel main function
 void kernel_main(void)
 {
 	memset(__bss, 0, (size_t)(__bss_end - __bss)); // Clear the BSS section
 	WRITE_CSR(stvec, (uint32_t)kernel_entry);
 
+	virtio_blk_init();
 	idle_proc = create_process(NULL, 0);
 	idle_proc->pid = 0;
 	current_proc = idle_proc;
@@ -385,7 +504,7 @@ void kernel_main(void)
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void)
 {
 	__asm__ __volatile__(
-		"mv sp, %[stack_top]\n" // Set the stack pointer
+		"mv sp, [stack_top]\n" // Set the stack pointer
 		"j kernel_main\n" // Jump to the kernel main function
 		:
 		: [stack_top] "r"(
