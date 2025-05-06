@@ -2,12 +2,6 @@
 
 extern char __stack_top[];
 
-__attribute__((noreturn)) void exit(void)
-{
-	for (;;)
-		;
-}
-
 int syscall(int sysno, int arg0, int arg1, int arg2)
 {
 	// TODO
@@ -34,7 +28,6 @@ int getchar(void)
 	return syscall(SYS_GETCHAR, 0, 0, 0);
 }
 
-
 __attribute__((section(".text.start"))) __attribute__((naked)) void start(void)
 {
 	// call main and exit via asm
@@ -43,4 +36,11 @@ __attribute__((section(".text.start"))) __attribute__((naked)) void start(void)
 		"call main\n"
 		"call exit\n" ::[stack_top] "r"(__stack_top) // stack top
 	);
+}
+
+__attribute__((noreturn)) void exit(void)
+{
+	syscall(SYS_EXIT, 0, 0, 0);
+	for (;;)
+		;
 }

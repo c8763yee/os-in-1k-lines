@@ -24,6 +24,7 @@ typedef uint32_t vaddr_t;
 // system call numbers
 #define SYS_PUTCHAR 1
 #define SYS_GETCHAR 2
+#define SYS_EXIT 3
 #define SCAUSE_ECALL 8
 
 void *memset(void *buf, char c, size_t n);

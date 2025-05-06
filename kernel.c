@@ -257,6 +257,11 @@ void handle_syscall(struct trap_frame *f)
 			yield();
 		}
 		break;
+	case SYS_EXIT:
+		printf("Process %d exit\n", current_proc->pid);
+		current_proc->state = PROC_UNUSED;
+		yield();
+		PANIC("UNREACHED");
 	default:
 		PANIC("Unknown syscall %d", f->a3);
 	}
@@ -374,7 +379,7 @@ void kernel_main(void)
 	create_process(_binary_shell_bin_start, (size_t)_binary_shell_bin_size);
 
 	yield();
-	PANIC("DONE");
+	PANIC("Switched into idle process");
 }
 
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void)

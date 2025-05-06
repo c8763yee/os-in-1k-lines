@@ -1,6 +1,6 @@
 #include "user.h"
 
-void main(void)
+int main(void)
 {
 	while (1) {
 prompt:
@@ -12,7 +12,8 @@ prompt:
 			if (i >= sizeof(cmdline) - 1) { // input command
 				printf("\nCommand too long\n");
 				goto prompt;
-			} else if (ch == '\r') { // complete command
+			} else if (ch ==
+				   '\r') { // complete command(it's \r in qemu terminal)
 				printf("\n");
 				cmdline[i] = 0;
 				break;
@@ -22,8 +23,10 @@ prompt:
 		}
 
 		// command processing
-		if (strcmp(cmdline, "hello")) {
+		if (strcmp(cmdline, "hello") == 0) {
 			printf("Hi!\n");
+		} else if (strcmp(cmdline, "exit") == 0) {
+			exit();
 		} else {
 			printf("Unknown command: %s\n", cmdline);
 		}
