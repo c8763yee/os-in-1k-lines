@@ -483,7 +483,34 @@ void virtio_blk_init(void)
 		alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
 	blk_req = (struct virtio_blk_req *)bld_req_paddr;
 }
+// Notifies the device that a new request is available
+// desc_index: index of the descriptor in the virtqueue
+void virtq_kick(struct virtio_virtq *vq, int desc_index)
+{
+	vq->avail.ring[vp->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+	vq->avail.index++;
 
+	__sync_synchronize(); // Ensure the write to the avail ring is visible
+}
+
+//Return whether there are requests being processed by the device
+bool virtq_is_busy(struct virtio_virtq *vq)
+{
+	return vq->last_used_index != *vq->used_index;
+}
+
+// Read/write from /to virtio-blk devices
+void read_write_disk(void *buf, unsigned sector, int is_write)
+{
+	if (sector >= blk_capacity / SECTOR_SIZE) {
+		printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
+		       sector, blk_capacity / SECTOR_SIZE);
+
+		return;
+	}
+
+	blk_req->sector = sector;
+}
 // kernel main function
 void kernel_main(void)
 {
